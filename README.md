@@ -334,4 +334,4 @@ Notes on deletion behavior:
 - **Not runtime-tested here:** Template validation checks structure only, not
   that the EC2 boot script succeeds. Confirm on first deploy via
   `/var/log/user-data.log`.
-test
+test2
