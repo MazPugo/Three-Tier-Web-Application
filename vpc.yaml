@@ -439,7 +439,10 @@ Resources:
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
-      DBInstanceIdentifier: !Sub '${AWS::StackName}-mysql-replica'
+      # No DBInstanceIdentifier: a custom-named resource cannot be replaced in
+      # place, which deadlocks the stack if the replica's AZ (a replace-only
+      # property) changes. Let CloudFormation auto-name it; the Name tag below
+      # still identifies it in the console.
       SourceDBInstanceIdentifier: !Ref MySQLDatabase
       DBInstanceClass: !Ref DBInstanceClass
       AvailabilityZone: !Ref ReadReplicaAvailabilityZone

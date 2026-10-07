@@ -26,7 +26,9 @@ env:
   # Non-sensitive deployment inputs (AZs must belong to AWS_REGION).
   AVAILABILITY_ZONE: us-east-1a
   AVAILABILITY_ZONE_2: us-east-1b
-  READ_REPLICA_AZ: us-east-1c
+  # Replica AZ must be one the DB subnet group covers (us-east-1a or us-east-1b).
+  # us-east-1c has no subnet in the group, so the replica cannot launch there.
+  READ_REPLICA_AZ: us-east-1b
   KEY_NAME: wordpress-key
 
 jobs:
