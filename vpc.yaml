@@ -1,0 +1,1020 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Three-tier WordPress stack: VPC (2 public + 2 private subnets), MySQL RDS with
+  read replica, EFS shared storage, an ALB + Auto Scaling Group of WordPress web
+  servers, CloudFront + WAF at the edge, a CloudWatch dashboard, and an AWS
+  Backup plan with daily 30-day backups of the RDS, EFS, and EC2 resources.
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for the first public subnet.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.4.0/24
+    Description: CIDR block for the second public subnet (required for the Application Load Balancer).
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for the first private subnet.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.3.0/24
+    Description: CIDR block for the second private subnet (required for the RDS DB subnet group).
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: The Availability Zone for the public subnet and the first private subnet.
+
+  AvailabilityZone2:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: >
+      The Availability Zone for the second private subnet. Must be different from
+      AvailabilityZone so the RDS DB subnet group spans two Availability Zones.
+
+  # ---- Database parameters ----
+  DBName:
+    Type: String
+    Default: wordpress
+    Description: The name of the initial MySQL database WordPress will use.
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9]*$'
+    MinLength: 1
+    MaxLength: 64
+
+  DBUsername:
+    Type: String
+    Default: wpadmin
+    Description: The master username for the MySQL instance.
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9]*$'
+    MinLength: 1
+    MaxLength: 16
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    Description: The compute and memory capacity of the RDS instance.
+
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 1000
+    Description: The allocated storage in gibibytes (GiB).
+
+  DBEngineVersion:
+    Type: String
+    Default: '8.0'
+    Description: The MySQL engine version.
+
+  ReadReplicaAvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: >
+      The Availability Zone for the RDS read replica. Should differ from the
+      primary database AZ for availability.
+
+  CacheNodeType:
+    Type: String
+    Default: cache.t3.micro
+    Description: The node type for the ElastiCache Redis cluster.
+
+  # ---- Web server parameters ----
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: The EC2 instance type for the WordPress web server.
+
+  LatestAmazonLinux2Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: SSM parameter that resolves to the latest Amazon Linux 2 AMI.
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 key pair to enable SSH access to the web server.
+
+  SSHLocation:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: The CIDR range allowed to reach the web servers over SSH.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  ASGMinSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Minimum number of WordPress instances in the Auto Scaling Group.
+
+  ASGMaxSize:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: Maximum number of WordPress instances in the Auto Scaling Group.
+
+  ASGDesiredCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Desired number of WordPress instances in the Auto Scaling Group.
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Ref AvailabilityZone
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-subnet'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Ref AvailabilityZone2
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-subnet-2'
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Ref AvailabilityZone
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Ref AvailabilityZone2
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet-2'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt'
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---- Security groups ----
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP/HTTPS from anywhere to the load balancer.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from anywhere.
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS from anywhere.
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb-sg'
+
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from the load balancer and SSH from the allowed CIDR.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: HTTP from the Application Load Balancer.
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+          Description: SSH from the allowed CIDR.
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-web-sg'
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL access only from the web server security group.
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-db-sg'
+
+  DBSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref WebServerSecurityGroup
+      Description: MySQL access from the WordPress web server.
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow NFS access only from the web server security group.
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-efs-sg'
+
+  EFSSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EFSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref WebServerSecurityGroup
+      Description: NFS (EFS) access from the WordPress web servers.
+
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Redis access only from the web server security group.
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cache-sg'
+
+  CacheSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref CacheSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref WebServerSecurityGroup
+      Description: Redis access from the WordPress web servers.
+
+  # ---- Shared file system (EFS) ----
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-efs'
+
+  EFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref PrivateSubnet2
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  # ---- Database ----
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-db-secret'
+      Description: Master credentials for the WordPress MySQL database.
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${DBUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-db-secret'
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group spanning the private subnets for the MySQL RDS instance.
+      SubnetIds:
+        - !Ref PrivateSubnet
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-db-subnet-group'
+
+  MySQLDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-mysql'
+      DBName: !Ref DBName
+      Engine: mysql
+      EngineVersion: !Ref DBEngineVersion
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DBSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      MultiAZ: false
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-mysql'
+
+  DBSecretTargetAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DBSecret
+      TargetId: !Ref MySQLDatabase
+      TargetType: AWS::RDS::DBInstance
+
+  MySQLReadReplica:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-mysql-replica'
+      SourceDBInstanceIdentifier: !Ref MySQLDatabase
+      DBInstanceClass: !Ref DBInstanceClass
+      AvailabilityZone: !Ref ReadReplicaAvailabilityZone
+      StorageEncrypted: true
+      PubliclyAccessible: false
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-mysql-replica'
+
+  # ---- Object cache (ElastiCache Redis) ----
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Subnet group spanning the private subnets for the Redis cluster.
+      SubnetIds:
+        - !Ref PrivateSubnet
+        - !Ref PrivateSubnet2
+
+  RedisReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub '${AWS::StackName}-redis'
+      ReplicationGroupDescription: Redis object cache for WordPress.
+      Engine: redis
+      CacheNodeType: !Ref CacheNodeType
+      NumCacheClusters: 1
+      Port: 6379
+      AutomaticFailoverEnabled: false
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds:
+        - !Ref CacheSecurityGroup
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-redis'
+
+  # ---- Load balancer ----
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-alb'
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb'
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-tg'
+      VpcId: !Ref VPC
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: 200-399
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-tg'
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ---- Web tier (Launch Template + Auto Scaling Group) ----
+  WebServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-web-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReadDBSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref DBSecret
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-web-role'
+
+  WebServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WebServerRole
+
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn:
+      - MySQLDatabase
+      - MySQLReadReplica
+      - RedisReplicationGroup
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-wordpress-lt'
+      LaunchTemplateData:
+        InstanceType: !Ref InstanceType
+        ImageId: !Ref LatestAmazonLinux2Ami
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Arn: !GetAtt WebServerInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WebServerSecurityGroup
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-wordpress'
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            # Log user-data output for troubleshooting
+            exec > >(tee /var/log/user-data.log) 2>&1
+
+            # Install Apache, PHP, the MySQL client, the EFS mount helper, jq, the
+            # AWS CLI, and the PHP Redis extension for the WordPress object cache.
+            amazon-linux-extras enable php7.4
+            yum clean metadata
+            yum install -y httpd php php-mysqlnd php-json php-gd php-mbstring php-xml php-pecl-redis mariadb amazon-efs-utils jq awscli
+
+            systemctl enable httpd
+
+            # Fetch the database credentials from Secrets Manager
+            SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id ${DBSecret} --query SecretString --output text --region ${AWS::Region})
+            DB_USER=$(echo "$SECRET_JSON" | jq -r .username)
+            DB_PASS=$(echo "$SECRET_JSON" | jq -r .password)
+
+            # Mount the shared EFS file system at /var/www/html/wp-content so that
+            # uploads, themes, and plugins are shared across all instances.
+            WP_CONTENT=/var/www/html/wp-content
+            mkdir -p "$WP_CONTENT"
+            echo "${EFSFileSystem}:/ $WP_CONTENT efs _netdev,tls 0 0" >> /etc/fstab
+
+            # Retry the mount until an EFS mount target is reachable
+            for i in $(seq 1 30); do
+              if mount -a -t efs; then
+                break
+              fi
+              echo "Waiting for EFS mount target... attempt $i"
+              sleep 10
+            done
+
+            # Download and lay down WordPress (excluding wp-content, which lives on EFS)
+            cd /tmp
+            curl -o /tmp/wordpress.tar.gz https://wordpress.org/latest.tar.gz
+            tar -xzf /tmp/wordpress.tar.gz -C /tmp
+            # Copy core files but do not clobber the shared wp-content on EFS
+            rsync -a --exclude 'wp-content' /tmp/wordpress/ /var/www/html/
+
+            # Seed wp-content on EFS only if it is empty (first instance to boot wins)
+            if [ -z "$(ls -A "$WP_CONTENT" 2>/dev/null)" ]; then
+              cp -r /tmp/wordpress/wp-content/* "$WP_CONTENT"/
+            fi
+            rm -rf /tmp/wordpress /tmp/wordpress.tar.gz
+
+            # Build wp-config.php from the sample, pointing at the RDS endpoint.
+            # Credentials come from Secrets Manager (fetched above); use '|' as the
+            # sed delimiter so special characters in the password are not treated as syntax.
+            cp /var/www/html/wp-config-sample.php /var/www/html/wp-config.php
+            sed -i "s|database_name_here|${DBName}|" /var/www/html/wp-config.php
+            sed -i "s|username_here|$DB_USER|" /var/www/html/wp-config.php
+            sed -i "s|password_here|$DB_PASS|" /var/www/html/wp-config.php
+            sed -i "s|localhost|${MySQLDatabase.Endpoint.Address}:${MySQLDatabase.Endpoint.Port}|" /var/www/html/wp-config.php
+
+            # Fetch unique salts for the auth keys
+            SALT=$(curl -s https://api.wordpress.org/secret-key/1.1/salt/)
+            STRING='put your unique phrase here'
+            printf '%s\n' "g/$STRING/d" a "$SALT" . w | ed -s /var/www/html/wp-config.php || true
+
+            # ---- HTTPS behind CloudFront/ALB ----
+            # CloudFront terminates TLS and forwards to the ALB over HTTP, so WordPress
+            # otherwise builds http:// URLs and loops against CloudFront's redirect-to-https.
+            # Trust the X-Forwarded-Proto header so WordPress knows the request is HTTPS.
+            # Inserted immediately after the opening <?php tag so it runs before WordPress
+            # determines the scheme.
+            sed -i "0,/^<?php/s//<?php\nif ( isset( \$_SERVER['HTTP_X_FORWARDED_PROTO'] ) \&\& \$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https' ) { \$_SERVER['HTTPS'] = 'on'; }/" /var/www/html/wp-config.php
+
+            # ---- Redis object cache ----
+            # Define the Redis connection so the Redis Object Cache drop-in uses it.
+            cat >> /var/www/html/wp-config.php <<'PHP_REDIS'
+
+            // Redis object cache configuration
+            define( 'WP_REDIS_HOST', '${RedisReplicationGroup.PrimaryEndPoint.Address}' );
+            define( 'WP_REDIS_PORT', ${RedisReplicationGroup.PrimaryEndPoint.Port} );
+            define( 'WP_REDIS_TIMEOUT', 1 );
+            define( 'WP_REDIS_READ_TIMEOUT', 1 );
+            define( 'WP_CACHE', true );
+            PHP_REDIS
+
+            # Set permissions and start Apache NOW, before the optional drop-in
+            # downloads. WordPress must serve traffic even if those downloads fail,
+            # otherwise the ALB health check fails and the ASG replaces the instance.
+            chown -R apache:apache /var/www/html
+            find /var/www/html -type d -exec chmod 755 {} \;
+            find /var/www/html -type f -exec chmod 644 {} \;
+            systemctl enable httpd
+            systemctl restart httpd
+
+            # From here on, failures must NOT abort the script (optional features).
+            set +e
+
+            # ---- Redis object cache drop-in ----
+            # The object-cache.php drop-in is intentionally NOT installed automatically.
+            # It loads before everything else and, if it cannot connect to Redis or is
+            # otherwise incompatible, causes a site-wide HTTP 500 on every request.
+            # Because wp-content lives on shared EFS, a single bad drop-in would poison
+            # every instance, so we actively remove any stale copy left on EFS.
+            # The PHP redis extension and WP_REDIS_* constants are already in place, so
+            # the Redis Object Cache plugin can be enabled from the WordPress admin UI
+            # later once the site is confirmed healthy.
+            rm -f "$WP_CONTENT/object-cache.php" || true
+
+            # ---- Read/write splitting (HyperDB) ----
+            # The HyperDB db.php drop-in is intentionally NOT installed automatically:
+            # it replaces WordPress's entire DB layer and loads before everything else,
+            # so any incompatibility causes a site-wide HTTP 500. WordPress runs against
+            # the RDS primary by default. To enable read-splitting later, install the
+            # HyperDB drop-in and a db-config.php referencing the read replica endpoint:
+            #   Primary:  ${MySQLDatabase.Endpoint.Address}:${MySQLDatabase.Endpoint.Port}
+            #   Replica:  ${MySQLReadReplica.Endpoint.Address}:${MySQLReadReplica.Endpoint.Port}
+            # Verify compatibility with the PHP/WordPress version before enabling.
+
+            # Permissions
+            chown -R apache:apache /var/www/html
+            find /var/www/html -type d -exec chmod 755 {} \;
+            find /var/www/html -type f -exec chmod 644 {} \;
+
+            systemctl restart httpd
+
+  WebServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - ALBListener
+      - EFSMountTarget1
+      - EFSMountTarget2
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-wordpress-asg'
+      MinSize: !Ref ASGMinSize
+      MaxSize: !Ref ASGMaxSize
+      DesiredCapacity: !Ref ASGDesiredCapacity
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+        - !Ref PublicSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-wordpress'
+          PropagateAtLaunch: true
+
+  # ---- Monitoring ----
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "EC2 CPUUtilization (Auto Scaling Group)",
+                "region": "${AWS::Region}",
+                "stat": "Average",
+                "period": 300,
+                "view": "timeSeries",
+                "metrics": [
+                  [ "AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "${WebServerAutoScalingGroup}" ]
+                ],
+                "yAxis": { "left": { "min": 0, "max": 100 } }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "RDS CPUUtilization",
+                "region": "${AWS::Region}",
+                "stat": "Average",
+                "period": 300,
+                "view": "timeSeries",
+                "metrics": [
+                  [ "AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "${MySQLDatabase}" ]
+                ],
+                "yAxis": { "left": { "min": 0, "max": 100 } }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 6, "width": 24, "height": 6,
+              "properties": {
+                "title": "ALB RequestCount",
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 300,
+                "view": "timeSeries",
+                "metrics": [
+                  [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${ApplicationLoadBalancer.LoadBalancerFullName}" ]
+                ]
+              }
+            }
+          ]
+        }
+
+  # ---- Edge security (WAF + CloudFront) ----
+  # NOTE: A CLOUDFRONT-scoped Web ACL must be created in us-east-1. This stack is
+  # deployed in us-east-1, so the Web ACL and CloudFront distribution live here.
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${AWS::StackName}-web-acl'
+      Scope: CLOUDFRONT
+      Description: Managed-rule protection for SQL injection and cross-site scripting.
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${AWS::StackName}-web-acl'
+      Rules:
+        - Name: AWS-AWSManagedRulesSQLiRuleSet
+          Priority: 0
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesSQLiRuleSet
+        - Name: AWS-AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSet
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-web-acl'
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${AWS::StackName} WordPress distribution'
+        WebACLId: !GetAtt WebACL.Arn
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: ALBOrigin
+            DomainName: !GetAtt ApplicationLoadBalancer.DNSName
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: ALBOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # CachingDisabled managed policy – WordPress is dynamic by default.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          # AllViewer managed origin request policy – forward all headers/cookies/query strings.
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-cloudfront'
+
+  # ---- Backups (AWS Backup) ----
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: !Sub '${AWS::StackName}-backup-vault'
+      BackupVaultTags:
+        Name: !Sub '${AWS::StackName}-backup-vault'
+
+  BackupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-backup-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: backup.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-backup-role'
+
+  BackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Sub '${AWS::StackName}-daily-plan'
+        BackupPlanRule:
+          - RuleName: DailyBackupsRetain30Days
+            TargetBackupVault: !Ref BackupVault
+            # Daily at 05:00 UTC
+            ScheduleExpression: cron(0 5 * * ? *)
+            StartWindowMinutes: 60
+            CompletionWindowMinutes: 180
+            Lifecycle:
+              DeleteAfterDays: 30
+      BackupPlanTags:
+        Name: !Sub '${AWS::StackName}-daily-plan'
+
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref BackupPlan
+      BackupSelection:
+        SelectionName: !Sub '${AWS::StackName}-backup-selection'
+        IamRoleArn: !GetAtt BackupRole.Arn
+        # Stable resources selected by ARN; EC2 instances selected by tag because
+        # the Auto Scaling Group creates and replaces them with changing IDs.
+        Resources:
+          - !GetAtt MySQLDatabase.DBInstanceArn
+          - !GetAtt EFSFileSystem.Arn
+        ListOfTags:
+          - ConditionType: STRINGEQUALS
+            ConditionKey: Name
+            ConditionValue: !Sub '${AWS::StackName}-wordpress'
+
+Outputs:
+  VpcId:
+    Description: The ID of the VPC.
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  PublicSubnetId:
+    Description: The ID of the first public subnet.
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnetId'
+
+  PublicSubnet2Id:
+    Description: The ID of the second public subnet.
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet2Id'
+
+  PrivateSubnetId:
+    Description: The ID of the first private subnet.
+    Value: !Ref PrivateSubnet
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetId'
+
+  PrivateSubnet2Id:
+    Description: The ID of the second private subnet.
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2Id'
+
+  DBEndpointAddress:
+    Description: The connection endpoint address for the MySQL instance.
+    Value: !GetAtt MySQLDatabase.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-DBEndpointAddress'
+
+  DBEndpointPort:
+    Description: The port on which the MySQL instance accepts connections.
+    Value: !GetAtt MySQLDatabase.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-DBEndpointPort'
+
+  DBSecretArn:
+    Description: The ARN of the Secrets Manager secret holding the DB credentials.
+    Value: !Ref DBSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-DBSecretArn'
+
+  ReadReplicaEndpointAddress:
+    Description: The endpoint address of the RDS read replica (used for reads).
+    Value: !GetAtt MySQLReadReplica.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-ReadReplicaEndpointAddress'
+
+  RedisEndpointAddress:
+    Description: The primary endpoint address of the ElastiCache Redis object cache.
+    Value: !GetAtt RedisReplicationGroup.PrimaryEndPoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-RedisEndpointAddress'
+
+  EFSFileSystemId:
+    Description: The ID of the shared EFS file system hosting wp-content.
+    Value: !Ref EFSFileSystem
+    Export:
+      Name: !Sub '${AWS::StackName}-EFSFileSystemId'
+
+  LoadBalancerDNSName:
+    Description: The DNS name of the Application Load Balancer.
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerDNSName'
+
+  WordPressURL:
+    Description: The public URL to reach the WordPress site through CloudFront (WAF-protected).
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+
+  CloudFrontDomainName:
+    Description: The CloudFront distribution domain name.
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontDomainName'
+
+  WebACLArn:
+    Description: The ARN of the WAF Web ACL associated with the distribution.
+    Value: !GetAtt WebACL.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-WebACLArn'
+
+  BackupVaultName:
+    Description: The name of the AWS Backup vault storing the backups.
+    Value: !Ref BackupVault
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupVaultName'
+
+  BackupPlanId:
+    Description: The ID of the AWS Backup plan.
+    Value: !Ref BackupPlan
+    Export:
+      Name: !Sub '${AWS::StackName}-BackupPlanId'
+
+  DashboardURL:
+    Description: The URL of the CloudWatch monitoring dashboard.
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${MonitoringDashboard}'

@@ -1,0 +1,73 @@
+name: Deploy CloudFormation Stack
+
+# Deploy the three-tier WordPress stack on every push to main.
+on:
+  push:
+    branches:
+      - main
+  # Allow manual runs from the Actions tab as well.
+  workflow_dispatch:
+
+# Required for GitHub OIDC: the workflow needs to request an OIDC token
+# to assume the AWS IAM role. No long-lived access keys are used.
+permissions:
+  id-token: write
+  contents: read
+
+# Prevent overlapping deployments of the same stack.
+concurrency:
+  group: cfn-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: three-tier-vpc
+  TEMPLATE_FILE: vpc.yaml
+  # Non-sensitive deployment inputs (AZs must belong to AWS_REGION).
+  AVAILABILITY_ZONE: us-east-1a
+  AVAILABILITY_ZONE_2: us-east-1b
+  READ_REPLICA_AZ: us-east-1c
+  KEY_NAME: wordpress-key
+
+jobs:
+  deploy:
+    name: Validate and deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # The IAM role GitHub assumes via OIDC. Store its ARN as a repository
+          # variable (not a secret) named AWS_DEPLOY_ROLE_ARN.
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: github-actions-cfn-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate the CloudFormation template
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://${TEMPLATE_FILE}
+
+      - name: Deploy the CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --template-file "${TEMPLATE_FILE}" \
+            --stack-name "${STACK_NAME}" \
+            --parameter-overrides \
+                AvailabilityZone="${AVAILABILITY_ZONE}" \
+                AvailabilityZone2="${AVAILABILITY_ZONE_2}" \
+                ReadReplicaAvailabilityZone="${READ_REPLICA_AZ}" \
+                KeyName="${KEY_NAME}" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Show stack outputs
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name "${STACK_NAME}" \
+            --query "Stacks[0].Outputs" \
+            --output table

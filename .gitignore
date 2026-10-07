@@ -1,0 +1,28 @@
+# ---- Private keys and secrets ----
+# Never commit SSH / EC2 private keys
+*.pem
+*.key
+*.ppk
+wordpress-key.pem
+
+# Environment / credential files
+.env
+.env.*
+*.tfvars
+aws-credentials*
+credentials
+secrets.*
+
+# ---- OS / editor noise ----
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# ---- CloudFormation / build artifacts ----
+packaged*.yaml
+*.packaged.yaml
+
+# ---- Setup artifacts (generated locally, not for the repo) ----
+trust-policy.json
