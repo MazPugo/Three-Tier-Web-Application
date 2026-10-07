@@ -33,6 +33,11 @@ jobs:
   deploy:
     name: Validate and deploy
     runs-on: ubuntu-latest
+    # Declared at the job level as well as the top level so the OIDC token
+    # request works regardless of how permissions propagate.
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
       - name: Check out the repository
