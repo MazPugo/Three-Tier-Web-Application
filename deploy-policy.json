@@ -51,7 +51,6 @@
         "iam:CreateRole",
         "iam:DeleteRole",
         "iam:GetRole",
-        "iam:PassRole",
         "iam:AttachRolePolicy",
         "iam:DetachRolePolicy",
         "iam:PutRolePolicy",
@@ -69,6 +68,20 @@
         "iam:CreateServiceLinkedRole"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "PassRoleScopedToStackServices",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": [
+            "ec2.amazonaws.com",
+            "backup.amazonaws.com"
+          ]
+        }
+      }
     }
   ]
 }
