@@ -326,12 +326,20 @@ Notes on deletion behavior:
   bypass CloudFront/WAF by hitting the ALB DNS name directly. Restricting the ALB
   security group to CloudFront (prefix list or a secret origin header) is a
   recommended hardening step not yet applied.
-- **Replica lag:** Reads routed to the replica are eventually consistent; a read
-  immediately after a write may return slightly stale data.
-- **Boot-time downloads:** WordPress, the HyperDB drop-in, and the Redis Object
-  Cache drop-in are fetched from the internet during instance boot. This depends
-  on the public-subnet outbound path.
-- **Not runtime-tested here:** Template validation checks structure only, not
-  that the EC2 boot script succeeds. Confirm on first deploy via
-  `/var/log/user-data.log`.
-test2
+- **Read-splitting and object cache disabled by default:** The RDS read replica
+  and ElastiCache Redis cluster are provisioned, but WordPress is not wired to
+  them automatically. The HyperDB `db.php` and Redis `object-cache.php` drop-ins
+  were found to cause site-wide HTTP 500s when installed blindly at boot (they
+  load before everything and fail hard on any incompatibility, and because
+  `wp-content` lives on shared EFS a single bad drop-in poisons every instance).
+  The PHP redis extension and `WP_REDIS_*` constants are in place, so enable the
+  Redis Object Cache plugin from the WordPress admin once the site is healthy.
+  For read-splitting, add a tested HyperDB config pointing at the replica
+  endpoint.
+- **Boot-time downloads:** WordPress core is fetched from the internet during
+  instance boot via the public-subnet outbound path.
+- **Runtime-verified:** The stack was deployed to `us-east-1` and the WordPress
+  site confirmed serving HTTP 200 through CloudFront (health checks passing,
+  2/2 targets healthy). An `X-Forwarded-Proto` fix in `wp-config.php` prevents an
+  HTTP/HTTPS redirect loop behind CloudFront. If you redeploy and instances fail
+  health checks, inspect `/var/log/user-data.log` on an instance.
